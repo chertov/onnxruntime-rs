@@ -100,6 +100,15 @@ pub enum OrtError {
     /// Attempt to build a Rust `CString` from a null pointer
     #[error("Failed to build CString when original contains null: {0}")]
     CStringNulError(#[from] std::ffi::NulError),
+
+    #[cfg(feature = "dynamic-loading")]
+    /// An error occurred when creating an ONNX environment
+    #[error("Failed to load a dynamic library of ONNX runtime '{path:?}' err: {err:?}")]
+    DynamicLibraryLoadingError{
+        /// Library path which does not exists
+        path: PathBuf,
+        err: String,
+    },
 }
 
 /// Error used when dimensions of input (from model and from inference call)

@@ -134,7 +134,9 @@ use sys::OnnxEnumInt;
 
 // Re-export ndarray as it's part of the public API anyway
 pub use ndarray;
+use std::path::Path;
 
+#[cfg(not(feature = "dynamic-loading"))]
 lazy_static! {
     // static ref G_ORT: Arc<Mutex<AtomicPtr<sys::OrtApi>>> =
     //     Arc::new(Mutex::new(AtomicPtr::new(unsafe {
@@ -149,7 +151,27 @@ lazy_static! {
         Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
     };
 }
+#[cfg(feature = "dynamic-loading")]
+lazy_static! {
+    static ref G_ORT_API: Arc<Mutex<AtomicPtr<sys::OrtApi>>> = Arc::new(Mutex::new(AtomicPtr::new(std::ptr::null_mut())));
+}
+#[cfg(feature = "dynamic-loading")]
+pub fn load_runtime(path: &Path) -> Result<()> {
+    let onnxruntime = match unsafe { sys::OnnxRuntime::new(path) } {
+        Ok(onnxruntime) => onnxruntime,
+        Err(err) => return Err(OrtError::DynamicLibraryLoadingError{path: path.to_path_buf(), err: err.to_string()}),
+    };
+    let base: *const sys::OrtApiBase = unsafe { onnxruntime.OrtGetApiBase() };
+    assert_ne!(base, std::ptr::null());
+    let get_api: unsafe extern "C" fn(u32) -> *const onnxruntime_sys::OrtApi =
+        unsafe { (*base).GetApi.unwrap() };
+    let api: *const sys::OrtApi = unsafe { get_api(sys::ORT_API_VERSION) };
 
+    let mut g_ort_api = G_ORT_API.lock()
+        .expect("Failed to acquire lock: another thread panicked?");
+    *g_ort_api = AtomicPtr::new(api as *mut sys::OrtApi);
+    Ok(())
+}
 fn g_ort() -> sys::OrtApi {
     let mut api_ref = G_ORT_API
         .lock()

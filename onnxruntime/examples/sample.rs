@@ -10,6 +10,13 @@ use tracing_subscriber::FmtSubscriber;
 type Error = Box<dyn std::error::Error>;
 
 fn main() {
+    #[cfg(feature = "dynamic-loading")] {
+        // your shared ONNX runtime library
+        // for example on macos full path to library: ~/dev/onnxruntime/build/MacOS/RelWithDebInfo/libonnxruntime.1.7.0.dylib
+        let onnxruntime_path = "libonnxruntime.so";
+        onnxruntime::load_runtime(std::path::Path::new(onnxruntime_path)).unwrap();
+    }
+
     if let Err(e) = run() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
