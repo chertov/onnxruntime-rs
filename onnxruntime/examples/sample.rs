@@ -6,17 +6,26 @@ use onnxruntime::{
 };
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use std::sync::{Arc, Mutex};
 
 type Error = Box<dyn std::error::Error>;
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    #[cfg(feature = "dynamic-loading")] {
+        // your shared ONNX runtime library
+        // for example on macos full path to library: ~/dev/onnxruntime/build/MacOS/RelWithDebInfo/libonnxruntime.1.7.0.dylib
+        let onnxruntime_path = "/Users/user/dev/onnxruntime/build/MacOS/RelWithDebInfo/libonnxruntime.1.7.0.dylib";
+        let runtime = onnxruntime::load_runtime(std::path::Path::new(onnxruntime_path)).unwrap();
+        let api = onnxruntime::create_api(runtime.clone()).unwrap();
+        if let Err(e) = run(&api, runtime) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
+
 }
 
-fn run() -> Result<(), Error> {
+fn run(api: &onnxruntime_sys::OrtApi, runtime: Arc<Mutex<onnxruntime_sys::OnnxRuntime>>) -> Result<(), Error> {
     // Setup the example's log level.
     // NOTE: ONNX Runtime's log level is controlled separately when building the environment.
     let subscriber = FmtSubscriber::builder()
@@ -29,17 +38,19 @@ fn run() -> Result<(), Error> {
         .with_name("test")
         // The ONNX Runtime's log level can be different than the one of the wrapper crate or the application.
         .with_log_level(LoggingLevel::Info)
-        .build()?;
+        .build(api)?;
 
     let mut session = environment
         .new_session_builder()?
         .with_optimization_level(GraphOptimizationLevel::Basic)?
         .with_number_threads(1)?
+        .with_coreml(runtime)?
         // NOTE: The example uses SqueezeNet 1.0 (ONNX version: 1.3, Opset version: 8),
         //       _not_ SqueezeNet 1.1 as downloaded by '.with_model_downloaded(ImageClassification::SqueezeNet)'
         //       Obtain it with:
         //          curl -LO "https://github.com/onnx/models/raw/master/vision/classification/squeezenet/model/squeezenet1.0-8.onnx"
-        .with_model_from_file("squeezenet1.0-8.onnx")?;
+        .with_model_from_file("/Users/user/dev/onnxruntime-rs/onnxruntime/examples/squeezenet1.0-8.onnx")?;
+
 
     let input0_shape: Vec<usize> = session.inputs[0].dimensions().map(|d| d.unwrap()).collect();
     let output0_shape: Vec<usize> = session.outputs[0]

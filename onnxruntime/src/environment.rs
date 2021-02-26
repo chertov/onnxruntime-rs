@@ -12,24 +12,25 @@ use onnxruntime_sys as sys;
 
 use crate::{
     error::{status_to_result, OrtError, Result},
-    g_ort,
+    // g_ort,
     onnxruntime::custom_logger,
     session::SessionBuilder,
     LoggingLevel,
 };
 
-lazy_static! {
-    static ref G_ENV: Arc<Mutex<EnvironmentSingleton>> =
-        Arc::new(Mutex::new(EnvironmentSingleton {
-            name: String::from("uninitialized"),
-            env_ptr: AtomicPtr::new(std::ptr::null_mut()),
-        }));
-}
+// lazy_static! {
+//     static ref G_ENV: Arc<Mutex<EnvironmentSingleton>> =
+//         Arc::new(Mutex::new(EnvironmentSingleton {
+//             name: String::from("uninitialized"),
+//             env_ptr: AtomicPtr::new(std::ptr::null_mut()),
+//         }));
+// }
 
 #[derive(Debug)]
 struct EnvironmentSingleton {
     name: String,
     env_ptr: AtomicPtr<sys::OrtEnv>,
+    api: sys::OrtApi,
 }
 
 /// An [`Environment`](session/struct.Environment.html) is the main entry point of the ONNX Runtime.
@@ -76,23 +77,25 @@ impl Environment {
     pub fn name(&self) -> String {
         self.env.lock().unwrap().name.to_string()
     }
+    /// Return the current api of the current environment
+    pub fn api(&self) -> sys::OrtApi { self.env.lock().unwrap().api }
 
     pub(crate) fn env_ptr(&self) -> *const sys::OrtEnv {
         *self.env.lock().unwrap().env_ptr.get_mut()
     }
 
     #[tracing::instrument]
-    fn new(name: String, log_level: LoggingLevel) -> Result<Environment> {
+    fn new(api: &sys::OrtApi, name: String, log_level: LoggingLevel) -> Result<Environment> {
         // NOTE: Because 'G_ENV' is a lazy_static, locking it will, initially, create
         //      a new Arc<Mutex<EnvironmentSingleton>> with a strong count of 1.
         //      Cloning it to embed it inside the 'Environment' to return
         //      will thus increase the strong count to 2.
-        let mut environment_guard = G_ENV
-            .lock()
-            .expect("Failed to acquire lock: another thread panicked?");
-        let g_env_ptr = environment_guard.env_ptr.get_mut();
-        if g_env_ptr.is_null() {
-            debug!("Environment not yet initialized, creating a new one.");
+        // let mut environment_guard = G_ENV
+        //     .lock()
+        //     .expect("Failed to acquire lock: another thread panicked?");
+        // let g_env_ptr = environment_guard.env_ptr.get_mut();
+        // if g_env_ptr.is_null() {
+        //     debug!("Environment not yet initialized, creating a new one.");
 
             let mut env_ptr: *mut sys::OrtEnv = std::ptr::null_mut();
 
@@ -102,7 +105,7 @@ impl Environment {
 
             let cname = CString::new(name.clone()).unwrap();
 
-            let create_env_with_custom_logger = g_ort().CreateEnvWithCustomLogger.unwrap();
+            let create_env_with_custom_logger = api.CreateEnvWithCustomLogger.unwrap();
             let status = {
                 unsafe {
                     create_env_with_custom_logger(
@@ -115,36 +118,38 @@ impl Environment {
                 }
             };
 
-            status_to_result(status).map_err(OrtError::Environment)?;
+            status_to_result(api, status).map_err(OrtError::Environment)?;
 
             debug!(
                 env_ptr = format!("{:?}", env_ptr).as_str(),
                 "Environment created."
             );
 
-            *g_env_ptr = env_ptr;
-            environment_guard.name = name;
+            let env_ptr = AtomicPtr::new(env_ptr);
+            let env = EnvironmentSingleton{api: api.clone(), env_ptr, name};
+            // *g_env_ptr = env_ptr;
+            // environment_guard.name = name;
 
             // NOTE: Cloning the lazy_static 'G_ENV' will increase its strong count by one.
             //       If this 'Environment' is the only one in the process, the strong count
             //       will be 2:
             //          * one lazy_static 'G_ENV'
             //          * one inside the 'Environment' returned
-            Ok(Environment { env: G_ENV.clone() })
-        } else {
-            warn!(
-                name = environment_guard.name.as_str(),
-                env_ptr = format!("{:?}", environment_guard.env_ptr).as_str(),
-                "Environment already initialized, reusing it.",
-            );
-
-            // NOTE: Cloning the lazy_static 'G_ENV' will increase its strong count by one.
-            //       If this 'Environment' is the only one in the process, the strong count
-            //       will be 2:
-            //          * one lazy_static 'G_ENV'
-            //          * one inside the 'Environment' returned
-            Ok(Environment { env: G_ENV.clone() })
-        }
+            Ok(Environment { env: Arc::new(Mutex::new(env)) })
+        // } else {
+        //     warn!(
+        //         name = environment_guard.name.as_str(),
+        //         env_ptr = format!("{:?}", environment_guard.env_ptr).as_str(),
+        //         "Environment already initialized, reusing it.",
+        //     );
+        //
+        //     // NOTE: Cloning the lazy_static 'G_ENV' will increase its strong count by one.
+        //     //       If this 'Environment' is the only one in the process, the strong count
+        //     //       will be 2:
+        //     //          * one lazy_static 'G_ENV'
+        //     //          * one inside the 'Environment' returned
+        //     Ok(Environment { env: G_ENV.clone() })
+        // }
     }
 
     /// Create a new [`SessionBuilder`](../session/struct.SessionBuilder.html)
@@ -157,10 +162,10 @@ impl Environment {
 impl Drop for Environment {
     #[tracing::instrument]
     fn drop(&mut self) {
-        debug!(
-            global_arc_count = Arc::strong_count(&G_ENV),
-            "Dropping the Environment.",
-        );
+        // debug!(
+        //     global_arc_count = Arc::strong_count(&G_ENV),
+        //     "Dropping the Environment.",
+        // );
 
         let mut environment_guard = self
             .env
@@ -172,12 +177,12 @@ impl Drop for Environment {
         //       There is also the "original" 'G_ENV' which is a the lazy_static global.
         //       If there is no other environment, the strong count should be two and we
         //       can properly free the sys::OrtEnv pointer.
-        if Arc::strong_count(&G_ENV) == 2 {
-            let release_env = g_ort().ReleaseEnv.unwrap();
+        if Arc::strong_count(&self.env) == 2 {
+            let release_env = environment_guard.api.ReleaseEnv.unwrap();
             let env_ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
 
             debug!(
-                global_arc_count = Arc::strong_count(&G_ENV),
+                global_arc_count = Arc::strong_count(&self.env),
                 "Releasing the Environment.",
             );
 
@@ -230,8 +235,8 @@ impl EnvBuilder {
     }
 
     /// Commit the configuration to a new [`Environment`](environment/struct.Environment.html)
-    pub fn build(self) -> Result<Environment> {
-        Environment::new(self.name, self.log_level)
+    pub fn build(self, api: &sys::OrtApi) -> Result<Environment> {
+        Environment::new(api, self.name, self.log_level)
     }
 }
 

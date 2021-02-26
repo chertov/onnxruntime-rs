@@ -19,7 +19,7 @@ use crate::{
     char_p_to_string,
     environment::Environment,
     error::{status_to_result, NonMatchingDimensionsError, OrtError, Result},
-    g_ort,
+
     memory::MemoryInfo,
     tensor::{
         ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor},
@@ -31,6 +31,7 @@ use crate::{
 
 #[cfg(feature = "model-fetching")]
 use crate::{download::AvailableOnnxModel, error::OrtDownloadError};
+use std::sync::{Mutex, Arc};
 
 /// Type used to create a session using the _builder pattern_
 ///
@@ -75,16 +76,16 @@ impl<'a> Drop for SessionBuilder<'a> {
     fn drop(&mut self) {
         debug!("Dropping the session options.");
         assert_ne!(self.session_options_ptr, std::ptr::null_mut());
-        unsafe { g_ort().ReleaseSessionOptions.unwrap()(self.session_options_ptr) };
+        unsafe { self.env.api().ReleaseSessionOptions.unwrap()(self.session_options_ptr) };
     }
 }
 
 impl<'a> SessionBuilder<'a> {
     pub(crate) fn new(env: &'a Environment) -> Result<SessionBuilder<'a>> {
         let mut session_options_ptr: *mut sys::OrtSessionOptions = std::ptr::null_mut();
-        let status = unsafe { g_ort().CreateSessionOptions.unwrap()(&mut session_options_ptr) };
+        let status = unsafe { env.api().CreateSessionOptions.unwrap()(&mut session_options_ptr) };
 
-        status_to_result(status).map_err(OrtError::SessionOptions)?;
+        status_to_result(&env.api(), status).map_err(OrtError::SessionOptions)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(session_options_ptr, std::ptr::null_mut());
 
@@ -100,12 +101,24 @@ impl<'a> SessionBuilder<'a> {
     pub fn with_number_threads(self, num_threads: i16) -> Result<SessionBuilder<'a>> {
         // FIXME: Pre-built binaries use OpenMP, set env variable instead
 
+        let api = &self.env.api();
         // We use a u16 in the builder to cover the 16-bits positive values of a i32.
         let num_threads = num_threads as i32;
         let status =
-            unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
-        status_to_result(status).map_err(OrtError::SessionOptions)?;
+            unsafe { api.SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
+        status_to_result(api, status).map_err(OrtError::SessionOptions)?;
         assert_eq!(status, std::ptr::null_mut());
+        Ok(self)
+    }
+
+    /// Set the session's allocator
+    ///
+    /// Defaults to [`AllocatorType::Arena`](../enum.AllocatorType.html#variant.Arena)
+    pub fn with_coreml(mut self, runtime: Arc<Mutex<onnxruntime_sys::OnnxRuntime>>) -> Result<SessionBuilder<'a>> {
+        let runtime = runtime.lock().unwrap();
+        let status =
+            unsafe { runtime.OrtSessionOptionsAppendExecutionProvider_CoreML(self.session_options_ptr, 0) };
+        status_to_result(&self.env.api(), status).map_err(OrtError::SessionOptions)?;
         Ok(self)
     }
 
@@ -116,7 +129,7 @@ impl<'a> SessionBuilder<'a> {
     ) -> Result<SessionBuilder<'a>> {
         // Sets graph optimization level
         unsafe {
-            g_ort().SetSessionGraphOptimizationLevel.unwrap()(
+            self.env.api().SetSessionGraphOptimizationLevel.unwrap()(
                 self.session_options_ptr,
                 opt_level.into(),
             )
@@ -189,35 +202,36 @@ impl<'a> SessionBuilder<'a> {
             .collect();
 
         let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
+        let api = &self.env.api();
 
         let status = unsafe {
-            g_ort().CreateSession.unwrap()(
+            api.CreateSession.unwrap()(
                 env_ptr,
                 model_path.as_ptr(),
                 self.session_options_ptr,
                 &mut session_ptr,
             )
         };
-        status_to_result(status).map_err(OrtError::Session)?;
+        status_to_result(api, status).map_err(OrtError::Session)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(session_ptr, std::ptr::null_mut());
 
         let mut allocator_ptr: *mut sys::OrtAllocator = std::ptr::null_mut();
-        let status = unsafe { g_ort().GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
-        status_to_result(status).map_err(OrtError::Allocator)?;
+        let status = unsafe { api.GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
+        status_to_result(api, status).map_err(OrtError::Allocator)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(allocator_ptr, std::ptr::null_mut());
 
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default)?;
+        let memory_info = MemoryInfo::new(api, AllocatorType::Arena, MemType::Default)?;
 
         // Extract input and output properties
-        let num_input_nodes = dangerous::extract_inputs_count(session_ptr)?;
-        let num_output_nodes = dangerous::extract_outputs_count(session_ptr)?;
+        let num_input_nodes = dangerous::extract_inputs_count(api, session_ptr)?;
+        let num_output_nodes = dangerous::extract_outputs_count(api, session_ptr)?;
         let inputs = (0..num_input_nodes)
-            .map(|i| dangerous::extract_input(session_ptr, allocator_ptr, i))
+            .map(|i| dangerous::extract_input(api, session_ptr, allocator_ptr, i))
             .collect::<Result<Vec<Input>>>()?;
         let outputs = (0..num_output_nodes)
-            .map(|i| dangerous::extract_output(session_ptr, allocator_ptr, i))
+            .map(|i| dangerous::extract_output(api, session_ptr, allocator_ptr, i))
             .collect::<Result<Vec<Output>>>()?;
 
         Ok(Session {
@@ -242,11 +256,12 @@ impl<'a> SessionBuilder<'a> {
         let mut session_ptr: *mut sys::OrtSession = std::ptr::null_mut();
 
         let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
+        let api = &self.env.api();
 
         let status = unsafe {
             let model_data = model_bytes.as_ptr() as *const std::ffi::c_void;
             let model_data_length = model_bytes.len() as u64;
-            g_ort().CreateSessionFromArray.unwrap()(
+            api.CreateSessionFromArray.unwrap()(
                 env_ptr,
                 model_data,
                 model_data_length,
@@ -254,26 +269,26 @@ impl<'a> SessionBuilder<'a> {
                 &mut session_ptr,
             )
         };
-        status_to_result(status).map_err(OrtError::Session)?;
+        status_to_result(api, status).map_err(OrtError::Session)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(session_ptr, std::ptr::null_mut());
 
         let mut allocator_ptr: *mut sys::OrtAllocator = std::ptr::null_mut();
-        let status = unsafe { g_ort().GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
-        status_to_result(status).map_err(OrtError::Allocator)?;
+        let status = unsafe { api.GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr) };
+        status_to_result(api, status).map_err(OrtError::Allocator)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(allocator_ptr, std::ptr::null_mut());
 
-        let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default)?;
+        let memory_info = MemoryInfo::new(api, AllocatorType::Arena, MemType::Default)?;
 
         // Extract input and output properties
-        let num_input_nodes = dangerous::extract_inputs_count(session_ptr)?;
-        let num_output_nodes = dangerous::extract_outputs_count(session_ptr)?;
+        let num_input_nodes = dangerous::extract_inputs_count(api, session_ptr)?;
+        let num_output_nodes = dangerous::extract_outputs_count(api, session_ptr)?;
         let inputs = (0..num_input_nodes)
-            .map(|i| dangerous::extract_input(session_ptr, allocator_ptr, i))
+            .map(|i| dangerous::extract_input(api, session_ptr, allocator_ptr, i))
             .collect::<Result<Vec<Input>>>()?;
         let outputs = (0..num_output_nodes)
-            .map(|i| dangerous::extract_output(session_ptr, allocator_ptr, i))
+            .map(|i| dangerous::extract_output(api, session_ptr, allocator_ptr, i))
             .collect::<Result<Vec<Output>>>()?;
 
         Ok(Session {
@@ -352,7 +367,7 @@ impl<'a> Drop for Session<'a> {
     #[tracing::instrument]
     fn drop(&mut self) {
         debug!("Dropping the session.");
-        unsafe { g_ort().ReleaseSession.unwrap()(self.session_ptr) };
+        unsafe { self.env.api().ReleaseSession.unwrap()(self.session_ptr) };
         // FIXME: There is no C function to release the allocator?
 
         self.session_ptr = std::ptr::null_mut();
@@ -422,8 +437,10 @@ impl<'a> Session<'a> {
 
         let run_options_ptr: *const sys::OrtRunOptions = std::ptr::null();
 
+        let api = &self.env.api();
+
         let status = unsafe {
-            g_ort().Run.unwrap()(
+            api.Run.unwrap()(
                 self.session_ptr,
                 run_options_ptr,
                 input_names_ptr.as_ptr(),
@@ -434,7 +451,7 @@ impl<'a> Session<'a> {
                 output_tensor_extractors_ptrs.as_mut_ptr(),
             )
         };
-        status_to_result(status).map_err(OrtError::Run)?;
+        status_to_result(api, status).map_err(OrtError::Run)?;
 
         let memory_info_ref = &self.memory_info;
         let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> =
@@ -444,11 +461,11 @@ impl<'a> Session<'a> {
                     let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo =
                         std::ptr::null_mut();
                     let status = unsafe {
-                        g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                        api.GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
                     };
-                    status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
-                    let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
-                    unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                    status_to_result(api, status).map_err(OrtError::GetTensorTypeAndShape)?;
+                    let dims = unsafe { get_tensor_dimensions(api, tensor_info_ptr) };
+                    unsafe { api.ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
                     let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
 
                     let mut output_tensor_extractor =
@@ -550,21 +567,22 @@ impl<'a> Session<'a> {
     }
 }
 
-unsafe fn get_tensor_dimensions(
+unsafe fn get_tensor_dimensions(api: &sys::OrtApi,
     tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo,
 ) -> Result<Vec<i64>> {
     let mut num_dims = 0;
-    let status = g_ort().GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims);
-    status_to_result(status).map_err(OrtError::GetDimensionsCount)?;
+
+    let status = api.GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims);
+    status_to_result(api, status).map_err(OrtError::GetDimensionsCount)?;
     assert_ne!(num_dims, 0);
 
     let mut node_dims: Vec<i64> = vec![0; num_dims as usize];
-    let status = g_ort().GetDimensions.unwrap()(
+    let status = api.GetDimensions.unwrap()(
         tensor_info_ptr,
         node_dims.as_mut_ptr(), // FIXME: UB?
         num_dims,
     );
-    status_to_result(status).map_err(OrtError::GetDimensions)?;
+    status_to_result(api, status).map_err(OrtError::GetDimensions)?;
     Ok(node_dims)
 }
 
@@ -574,47 +592,50 @@ unsafe fn get_tensor_dimensions(
 mod dangerous {
     use super::*;
 
-    pub(super) fn extract_inputs_count(session_ptr: *mut sys::OrtSession) -> Result<u64> {
-        let f = g_ort().SessionGetInputCount.unwrap();
-        extract_io_count(f, session_ptr)
+    pub(super) fn extract_inputs_count(api: &sys::OrtApi, session_ptr: *mut sys::OrtSession) -> Result<u64> {
+        let f = api.SessionGetInputCount.unwrap();
+        extract_io_count(api, f, session_ptr)
     }
 
-    pub(super) fn extract_outputs_count(session_ptr: *mut sys::OrtSession) -> Result<u64> {
-        let f = g_ort().SessionGetOutputCount.unwrap();
-        extract_io_count(f, session_ptr)
+    pub(super) fn extract_outputs_count(api: &sys::OrtApi, session_ptr: *mut sys::OrtSession) -> Result<u64> {
+        let f = api.SessionGetOutputCount.unwrap();
+        extract_io_count(api, f, session_ptr)
     }
 
-    fn extract_io_count(
+    fn extract_io_count(api: &sys::OrtApi,
         f: unsafe extern "C" fn(*const sys::OrtSession, *mut u64) -> *mut sys::OrtStatus,
         session_ptr: *mut sys::OrtSession,
     ) -> Result<u64> {
         let mut num_nodes: u64 = 0;
         let status = unsafe { f(session_ptr, &mut num_nodes) };
-        status_to_result(status).map_err(OrtError::InOutCount)?;
+        status_to_result(api, status).map_err(OrtError::InOutCount)?;
         assert_eq!(status, std::ptr::null_mut());
         assert_ne!(num_nodes, 0);
         Ok(num_nodes)
     }
 
     fn extract_input_name(
+        api: &sys::OrtApi,
         session_ptr: *mut sys::OrtSession,
         allocator_ptr: *mut sys::OrtAllocator,
         i: u64,
     ) -> Result<String> {
-        let f = g_ort().SessionGetInputName.unwrap();
-        extract_io_name(f, session_ptr, allocator_ptr, i)
+        let f = api.SessionGetInputName.unwrap();
+        extract_io_name(api, f, session_ptr, allocator_ptr, i)
     }
 
     fn extract_output_name(
+        api: &sys::OrtApi,
         session_ptr: *mut sys::OrtSession,
         allocator_ptr: *mut sys::OrtAllocator,
         i: u64,
     ) -> Result<String> {
-        let f = g_ort().SessionGetOutputName.unwrap();
-        extract_io_name(f, session_ptr, allocator_ptr, i)
+        let f = api.SessionGetOutputName.unwrap();
+        extract_io_name(api, f, session_ptr, allocator_ptr, i)
     }
 
     fn extract_io_name(
+        api: &sys::OrtApi,
         f: unsafe extern "C" fn(
             *const sys::OrtSession,
             u64,
@@ -628,7 +649,7 @@ mod dangerous {
         let mut name_bytes: *mut i8 = std::ptr::null_mut();
 
         let status = unsafe { f(session_ptr, i, allocator_ptr, &mut name_bytes) };
-        status_to_result(status).map_err(OrtError::InputName)?;
+        status_to_result(api, status).map_err(OrtError::InputName)?;
         assert_ne!(name_bytes, std::ptr::null_mut());
 
         // FIXME: Is it safe to keep ownership of the memory?
@@ -638,13 +659,14 @@ mod dangerous {
     }
 
     pub(super) fn extract_input(
+        api: &sys::OrtApi,
         session_ptr: *mut sys::OrtSession,
         allocator_ptr: *mut sys::OrtAllocator,
         i: u64,
     ) -> Result<Input> {
-        let input_name = extract_input_name(session_ptr, allocator_ptr, i)?;
-        let f = g_ort().SessionGetInputTypeInfo.unwrap();
-        let (input_type, dimensions) = extract_io(f, session_ptr, i)?;
+        let input_name = extract_input_name(api, session_ptr, allocator_ptr, i)?;
+        let f = api.SessionGetInputTypeInfo.unwrap();
+        let (input_type, dimensions) = extract_io(api, f, session_ptr, i)?;
         Ok(Input {
             name: input_name,
             input_type,
@@ -653,13 +675,14 @@ mod dangerous {
     }
 
     pub(super) fn extract_output(
+        api: &sys::OrtApi,
         session_ptr: *mut sys::OrtSession,
         allocator_ptr: *mut sys::OrtAllocator,
         i: u64,
     ) -> Result<Output> {
-        let output_name = extract_output_name(session_ptr, allocator_ptr, i)?;
-        let f = g_ort().SessionGetOutputTypeInfo.unwrap();
-        let (output_type, dimensions) = extract_io(f, session_ptr, i)?;
+        let output_name = extract_output_name(api, session_ptr, allocator_ptr, i)?;
+        let f = api.SessionGetOutputTypeInfo.unwrap();
+        let (output_type, dimensions) = extract_io(api, f, session_ptr, i)?;
         Ok(Output {
             name: output_name,
             output_type,
@@ -668,6 +691,7 @@ mod dangerous {
     }
 
     fn extract_io(
+        api: &sys::OrtApi,
         f: unsafe extern "C" fn(
             *const sys::OrtSession,
             u64,
@@ -679,20 +703,20 @@ mod dangerous {
         let mut typeinfo_ptr: *mut sys::OrtTypeInfo = std::ptr::null_mut();
 
         let status = unsafe { f(session_ptr, i as u64, &mut typeinfo_ptr) };
-        status_to_result(status).map_err(OrtError::GetTypeInfo)?;
+        status_to_result(api, status).map_err(OrtError::GetTypeInfo)?;
         assert_ne!(typeinfo_ptr, std::ptr::null_mut());
 
         let mut tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
         let status = unsafe {
-            g_ort().CastTypeInfoToTensorInfo.unwrap()(typeinfo_ptr, &mut tensor_info_ptr)
+            api.CastTypeInfoToTensorInfo.unwrap()(typeinfo_ptr, &mut tensor_info_ptr)
         };
-        status_to_result(status).map_err(OrtError::CastTypeInfoToTensorInfo)?;
+        status_to_result(api, status).map_err(OrtError::CastTypeInfoToTensorInfo)?;
         assert_ne!(tensor_info_ptr, std::ptr::null_mut());
 
         let mut type_sys = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
         let status =
-            unsafe { g_ort().GetTensorElementType.unwrap()(tensor_info_ptr, &mut type_sys) };
-        status_to_result(status).map_err(OrtError::TensorElementType)?;
+            unsafe { api.GetTensorElementType.unwrap()(tensor_info_ptr, &mut type_sys) };
+        status_to_result(api, status).map_err(OrtError::TensorElementType)?;
         assert_ne!(
             type_sys,
             sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
@@ -702,13 +726,13 @@ mod dangerous {
 
         // info!("{} : type={}", i, type_);
 
-        let node_dims = unsafe { get_tensor_dimensions(tensor_info_ptr)? };
+        let node_dims = unsafe { get_tensor_dimensions(api, tensor_info_ptr)? };
 
         // for j in 0..num_dims {
         //     info!("{} : dim {}={}", i, j, node_dims[j as usize]);
         // }
 
-        unsafe { g_ort().ReleaseTypeInfo.unwrap()(typeinfo_ptr) };
+        unsafe { api.ReleaseTypeInfo.unwrap()(typeinfo_ptr) };
 
         Ok((
             io_type,

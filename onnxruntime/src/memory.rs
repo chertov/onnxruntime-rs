@@ -4,31 +4,32 @@ use onnxruntime_sys as sys;
 
 use crate::{
     error::{status_to_result, OrtError, Result},
-    g_ort, AllocatorType, MemType,
+    AllocatorType, MemType,
 };
 
 #[derive(Debug)]
 pub(crate) struct MemoryInfo {
     pub ptr: *mut sys::OrtMemoryInfo,
+    pub api: sys::OrtApi,
 }
 
 impl MemoryInfo {
     #[tracing::instrument]
-    pub fn new(allocator: AllocatorType, memory_type: MemType) -> Result<Self> {
+    pub fn new(api: &sys::OrtApi, allocator: AllocatorType, memory_type: MemType) -> Result<Self> {
         debug!("Creating new memory info.");
         let mut memory_info_ptr: *mut sys::OrtMemoryInfo = std::ptr::null_mut();
         let status = unsafe {
-            g_ort().CreateCpuMemoryInfo.unwrap()(
+            api.CreateCpuMemoryInfo.unwrap()(
                 allocator.into(),
                 memory_type.into(),
                 &mut memory_info_ptr,
             )
         };
-        status_to_result(status).map_err(OrtError::CreateCpuMemoryInfo)?;
+        status_to_result(&api, status).map_err(OrtError::CreateCpuMemoryInfo)?;
         assert_ne!(memory_info_ptr, std::ptr::null_mut());
 
         Ok(Self {
-            ptr: memory_info_ptr,
+            ptr: memory_info_ptr, api: api.clone()
         })
     }
 }
@@ -39,7 +40,7 @@ impl Drop for MemoryInfo {
         debug!("Dropping the memory information.");
         assert_ne!(self.ptr, std::ptr::null_mut());
 
-        unsafe { g_ort().ReleaseMemoryInfo.unwrap()(self.ptr) };
+        unsafe { self.api.ReleaseMemoryInfo.unwrap()(self.ptr) };
 
         self.ptr = std::ptr::null_mut();
     }

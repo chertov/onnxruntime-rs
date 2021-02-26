@@ -32,6 +32,8 @@ const ORT_ENV_GPU: &str = "ORT_USE_CUDA";
 /// Subdirectory (of the 'target' directory) into which to extract the prebuilt library.
 const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
+const ENV_ANDROID_NDK_SYSROOT: &str = "ANDROID_NDK_SYSROOT";
+
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
     println!("Build script disabled!");
@@ -55,50 +57,89 @@ fn main() {
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_GPU);
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_SYSTEM_LIB_LOCATION);
 
-    generate_bindings(&include_dir);
+    generate_bindings(&include_dir, false);
+    generate_bindings(&include_dir, true);
 }
 
 #[cfg(not(feature = "generate-bindings"))]
-fn generate_bindings(_include_dir: &Path) {
+fn generate_bindings(_include_dir: &Path, _dynamic_loading: bool) {
     println!("Bindings not generated automatically, using committed files instead.");
     println!("Enable with the 'bindgen' cargo feature.");
 }
 
 #[cfg(feature = "generate-bindings")]
-fn generate_bindings(include_dir: &Path) {
-    let clang_arg = format!("-I{}", include_dir.display());
+fn generate_bindings(onnxruntime_include_dir: &Path, dynamic_loading: bool) {
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=src/generated/bindings.rs");
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
+    let mut clang_args = vec![];
+    clang_args.push(format!("-I{}", onnxruntime_include_dir.display()));
+    clang_args.push(format!("-I{}/onnxruntime/core/session", onnxruntime_include_dir.display()));
+
+    match target_os.as_str() {
+        "android" => {
+            println!("cargo:rerun-if-env-changed={}", ENV_ANDROID_NDK_SYSROOT);
+            let ndk_sysroot = std::env::var(ENV_ANDROID_NDK_SYSROOT).unwrap();
+            let ndk_include = format!("{}/usr/include", ndk_sysroot);
+            let ndk_target = match target_arch.as_str() {
+                "x86" => "i686-linux-android",
+                "x86_64" => "x86_64-linux-android",
+                "arm" => "arm-linux-androideabi",
+                "aarch64" => "aarch64-linux-android",
+                target => panic!("Unknown android target '{}'", target)
+            };
+            let ndk_target_include = format!("{}/{}", ndk_include, ndk_target);
+
+            clang_args.push(format!("-I{}", ndk_include));
+            clang_args.push(format!("-I{}", ndk_target_include));
+        },
+        _ => {}
+    }
+
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
-    let bindings = bindgen::Builder::default()
+    let builder = bindgen::Builder::default()
         // The input header we would like to generate
         // bindings for.
         .header("wrapper.h")
         // The current working directory is 'onnxruntime-sys'
-        .clang_arg(clang_arg)
+        .clang_args(clang_args)
+
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         // Format using rustfmt
         .rustfmt_bindings(true)
-        .rustified_enum("*")
-        // Finish the builder and generate the bindings.
-        .generate()
+        .rustified_enum("*");
+
+    let builder = match dynamic_loading {
+        true => builder.dynamic_library_name("OnnxRuntime"),
+        false => builder
+    };
+
+    // Finish the builder and generate the bindings.
+    let bindings = builder.generate()
         // Unwrap the Result and panic on failure.
         .expect("Unable to generate bindings");
 
-    // Write the bindings to (source controlled) src/generated/<os>/<arch>/bindings.rs
-    let generated_file = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+    // Write the bindings to (source controlled) src/generated/<os>/<arch>/bindings_<dynamic>.rs
+    let generated_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
         .join("src")
         .join("generated")
-        .join(env::var("CARGO_CFG_TARGET_OS").unwrap())
-        .join(env::var("CARGO_CFG_TARGET_ARCH").unwrap())
-        .join("bindings.rs");
+        .join(target_os)
+        .join(target_arch);
+    std::fs::create_dir_all(&generated_dir).unwrap();
+    let generated_file = generated_dir.join(match dynamic_loading {
+        true => "bindings_dynamic.rs",
+        false => "bindings.rs"
+    });
+
     println!("cargo:rerun-if-changed={:?}", generated_file);
     bindings
         .write_to_file(&generated_file)

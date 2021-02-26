@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use onnxruntime_sys as sys;
 
-use crate::{char_p_to_string, g_ort};
+use crate::{char_p_to_string};
 
 /// Type alias for the `Result`
 pub type Result<T> = std::result::Result<T, OrtError>;
@@ -100,6 +100,15 @@ pub enum OrtError {
     /// Attempt to build a Rust `CString` from a null pointer
     #[error("Failed to build CString when original contains null: {0}")]
     CStringNulError(#[from] std::ffi::NulError),
+
+    #[cfg(feature = "dynamic-loading")]
+    /// An error occurred when creating an ONNX environment
+    #[error("Failed to load a dynamic library of ONNX runtime '{path:?}' err: {err:?}")]
+    DynamicLibraryLoadingError{
+        /// Library path which does not exists
+        path: PathBuf,
+        err: String,
+    },
 }
 
 /// Error used when dimensions of input (from model and from inference call)
@@ -156,20 +165,27 @@ pub enum OrtDownloadError {
 /// Wrapper type around a ONNX C API's `OrtStatus` pointer
 ///
 /// This wrapper exists to facilitate conversion from C raw pointers to Rust error types
-pub struct OrtStatusWrapper(*const sys::OrtStatus);
-
-impl From<*const sys::OrtStatus> for OrtStatusWrapper {
-    fn from(status: *const sys::OrtStatus) -> Self {
-        OrtStatusWrapper(status)
+pub struct OrtStatusWrapper{
+    status: *const sys::OrtStatus,
+    api: sys::OrtApi,
+}
+impl OrtStatusWrapper {
+    fn new(api: &sys::OrtApi, status: *const sys::OrtStatus) -> Self {
+        Self{api: api.clone(), status}
     }
 }
+// impl From<*const sys::OrtStatus> for OrtStatusWrapper {
+//     fn from(api: sys::OrtApi, status: *const sys::OrtStatus) -> Self {
+//         OrtStatusWrapper{api, status}
+//     }
+// }
 
 impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
-    fn from(status: OrtStatusWrapper) -> Self {
-        if status.0.is_null() {
+    fn from(ort_status: OrtStatusWrapper) -> Self {
+        if ort_status.status.is_null() {
             Ok(())
         } else {
-            let raw: *const i8 = unsafe { g_ort().GetErrorMessage.unwrap()(status.0) };
+            let raw: *const i8 = unsafe { ort_status.api.GetErrorMessage.unwrap()(ort_status.status) };
             match char_p_to_string(raw) {
                 Ok(msg) => Err(OrtApiError::Msg(msg)),
                 Err(err) => match err {
@@ -184,16 +200,17 @@ impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
 }
 
 pub(crate) fn status_to_result(
+    api: &sys::OrtApi,
     status: *const sys::OrtStatus,
 ) -> std::result::Result<(), OrtApiError> {
-    let status_wrapper: OrtStatusWrapper = status.into();
+    let status_wrapper: OrtStatusWrapper = OrtStatusWrapper::new(api, status);
     status_wrapper.into()
 }
 
 /// A wrapper around a function on OrtApi that maps the status code into [OrtApiError]
-pub(crate) unsafe fn call_ort<F>(mut f: F) -> std::result::Result<(), OrtApiError>
+pub(crate) unsafe fn call_ort<F>(api: &sys::OrtApi, mut f: F) -> std::result::Result<(), OrtApiError>
 where
-    F: FnMut(sys::OrtApi) -> *const sys::OrtStatus,
+    F: FnMut(&sys::OrtApi) -> *const sys::OrtStatus,
 {
-    status_to_result(f(g_ort()))
+    status_to_result(api, f(api))
 }

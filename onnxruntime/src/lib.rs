@@ -134,7 +134,9 @@ use sys::OnnxEnumInt;
 
 // Re-export ndarray as it's part of the public API anyway
 pub use ndarray;
+use std::path::Path;
 
+#[cfg(not(feature = "dynamic-loading"))]
 lazy_static! {
     // static ref G_ORT: Arc<Mutex<AtomicPtr<sys::OrtApi>>> =
     //     Arc::new(Mutex::new(AtomicPtr::new(unsafe {
@@ -149,18 +151,46 @@ lazy_static! {
         Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
     };
 }
-
-fn g_ort() -> sys::OrtApi {
-    let mut api_ref = G_ORT_API
-        .lock()
-        .expect("Failed to acquire lock: another thread panicked?");
-    let api_ref_mut: &mut *mut sys::OrtApi = api_ref.get_mut();
-    let api_ptr_mut: *mut sys::OrtApi = *api_ref_mut;
-
-    assert_ne!(api_ptr_mut, std::ptr::null_mut());
-
-    unsafe { *api_ptr_mut }
+// #[cfg(feature = "dynamic-loading")]
+// lazy_static! {
+//     static ref G_ORT_API: Arc<Mutex<AtomicPtr<sys::OrtApi>>> = Arc::new(Mutex::new(AtomicPtr::new(std::ptr::null_mut())));
+// }
+#[cfg(feature = "dynamic-loading")]
+pub fn load_runtime(path: &Path) -> Result<Arc<Mutex<sys::OnnxRuntime>>> {
+    let onnxruntime = match unsafe { sys::OnnxRuntime::new(path) } {
+        Ok(onnxruntime) => onnxruntime,
+        Err(err) => return Err(OrtError::DynamicLibraryLoadingError{path: path.to_path_buf(), err: err.to_string()}),
+    };
+    println!("OrtSessionOptionsAppendExecutionProvider_CoreML is ok = {}", onnxruntime.OrtSessionOptionsAppendExecutionProvider_CoreML.is_ok());
+    // unsafe { onnxruntime.OrtSessionOptionsAppendExecutionProvider_CoreML((), 0) };
+    println!("OrtSessionOptionsAppendExecutionProvider_CUDA is ok = {}", onnxruntime.OrtSessionOptionsAppendExecutionProvider_CUDA.is_ok());
+    println!("OrtSessionOptionsAppendExecutionProvider_Nnapi is ok = {}", onnxruntime.OrtSessionOptionsAppendExecutionProvider_Nnapi.is_ok());
+    Ok(Arc::new(Mutex::new(onnxruntime)))
 }
+
+#[cfg(feature = "dynamic-loading")]
+pub fn create_api(runtime: Arc<Mutex<sys::OnnxRuntime>>) -> Result<sys::OrtApi> {
+    let onnxruntime = runtime.lock().unwrap();
+    let base: *const sys::OrtApiBase = unsafe { onnxruntime.OrtGetApiBase() };
+    assert_ne!(base, std::ptr::null());
+    let get_api: unsafe extern "C" fn(u32) -> *const onnxruntime_sys::OrtApi =
+        unsafe { (*base).GetApi.unwrap() };
+    let api_ptr: *const sys::OrtApi = unsafe { get_api(sys::ORT_API_VERSION) };
+    assert_ne!(api_ptr, std::ptr::null_mut());
+
+    Ok(unsafe { *api_ptr })
+}
+// fn g_ort() -> sys::OrtApi {
+//     let mut api_ref = G_ORT_API
+//         .lock()
+//         .expect("Failed to acquire lock: another thread panicked?");
+//     let api_ref_mut: &mut *mut sys::OrtApi = api_ref.get_mut();
+//     let api_ptr_mut: *mut sys::OrtApi = *api_ref_mut;
+//
+//     assert_ne!(api_ptr_mut, std::ptr::null_mut());
+//
+//     unsafe { *api_ptr_mut }
+// }
 
 fn char_p_to_string(raw: *const i8) -> Result<String> {
     let c_string = unsafe { std::ffi::CStr::from_ptr(raw as *mut i8).to_owned() };

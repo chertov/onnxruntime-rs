@@ -8,7 +8,7 @@ use tracing::debug;
 use onnxruntime_sys as sys;
 
 use crate::{
-    error::status_to_result, g_ort, memory::MemoryInfo, tensor::ndarray_tensor::NdArrayTensor,
+    error::status_to_result, memory::MemoryInfo, tensor::ndarray_tensor::NdArrayTensor,
     OrtError, Result, TypeToTensorElementDataType,
 };
 
@@ -91,10 +91,11 @@ where
         // As such, there is no need too free the pointer used to create the ArrayView.
 
         assert_ne!(self.tensor_ptr, std::ptr::null_mut());
+        let api = &self.memory_info.api;
 
         let mut is_tensor = 0;
-        let status = unsafe { g_ort().IsTensor.unwrap()(self.tensor_ptr, &mut is_tensor) };
-        status_to_result(status).map_err(OrtError::IsTensor)?;
+        let status = unsafe { api.IsTensor.unwrap()(self.tensor_ptr, &mut is_tensor) };
+        status_to_result(api, status).map_err(OrtError::IsTensor)?;
         assert_eq!(is_tensor, 1);
 
         // Get pointer to output tensor float values
@@ -103,9 +104,9 @@ where
         let output_array_ptr_ptr_void: *mut *mut std::ffi::c_void =
             output_array_ptr_ptr as *mut *mut std::ffi::c_void;
         let status = unsafe {
-            g_ort().GetTensorMutableData.unwrap()(self.tensor_ptr, output_array_ptr_ptr_void)
+            api.GetTensorMutableData.unwrap()(self.tensor_ptr, output_array_ptr_ptr_void)
         };
-        status_to_result(status).map_err(OrtError::IsTensor)?;
+        status_to_result(api, status).map_err(OrtError::IsTensor)?;
         assert_ne!(output_array_ptr, std::ptr::null_mut());
 
         let array_view = unsafe { ArrayView::from_shape_ptr(self.shape, output_array_ptr) };
@@ -127,7 +128,8 @@ where
     #[tracing::instrument]
     fn drop(&mut self) {
         debug!("Dropping OrtOwnedTensor.");
-        unsafe { g_ort().ReleaseValue.unwrap()(self.tensor_ptr) }
+        let api = &self.memory_info.api;
+        unsafe { api.ReleaseValue.unwrap()(self.tensor_ptr) }
 
         self.tensor_ptr = std::ptr::null_mut();
     }

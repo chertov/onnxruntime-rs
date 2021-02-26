@@ -36,11 +36,13 @@ tracing-subscriber = "0.2"
 ureq = "1.5.1"
 
 [features]
+default = ["dynamic-loading"]
 # Fetch model from ONNX Model Zoo (https://github.com/onnx/models)
 model-fetching = ["ureq"]
 # Disable build script; used for https://docs.rs
 disable-sys-build-script = ["onnxruntime-sys/disable-sys-build-script"]
 generate-bindings = ["onnxruntime-sys/generate-bindings"]
+dynamic-loading = ["onnxruntime-sys/dynamic-loading"]
 
 [package.metadata.docs.rs]
 features = ["disable-sys-build-script", "model-fetching"]

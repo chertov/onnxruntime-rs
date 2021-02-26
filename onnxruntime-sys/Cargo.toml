@@ -14,10 +14,16 @@ repository = "https://github.com/nbigaouette/onnxruntime-rs"
 categories = ["science"]
 keywords = ["neuralnetworks", "onnx", "bindings"]
 
+[[example]]
+name = "c_api_sample"
+# try to use "dynamic-loading" feature to load custom ONNX shared library at runtime
+# required-features = ["dynamic-loading"]
+
 [dependencies]
+libloading = {version = "0.7", optional = true}
 
 [build-dependencies]
-bindgen = {version = "0.55", optional = true}
+bindgen = {version = "0.57", optional = true}
 ureq = "1.5.1"
 
 # Used on Windows
@@ -34,6 +40,8 @@ default = []
 disable-sys-build-script = []
 # Use bindgen to generate bindings in build.rs
 generate-bindings = ["bindgen"]
+# Use dynamic library loading for onnx runtime
+dynamic-loading = ["libloading"]
 
 [package.metadata.docs.rs]
 # Disable the build.rs on https://docs.rs since it can cause

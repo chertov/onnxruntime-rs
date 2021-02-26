@@ -1,3 +1,4 @@
+#![feature(stmt_expr_attributes)]
 #![allow(non_snake_case)]
 
 #[cfg(not(target_family = "windows"))]
@@ -10,7 +11,20 @@ use onnxruntime_sys::*;
 // https://github.com/microsoft/onnxruntime/blob/v1.4.0/csharp/test/Microsoft.ML.OnnxRuntime.EndToEndTests.Capi/C_Api_Sample.cpp
 
 fn main() {
-    let g_ort = unsafe { OrtGetApiBase().as_ref().unwrap().GetApi.unwrap()(ORT_API_VERSION) };
+    let ort_api_base;
+    #[cfg(feature = "dynamic-loading")] {
+        // your shared ONNX runtime library
+        // for example on macos full path to library: ~/dev/onnxruntime/build/MacOS/RelWithDebInfo/libonnxruntime.1.7.0.dylib
+        let onnxruntime_path = "/Users/user/dev/onnxruntime/build/MacOS/RelWithDebInfo/libonnxruntime.1.7.0.dylib";
+        let onnxruntime = unsafe { onnxruntime_sys::OnnxRuntime::new(onnxruntime_path) }.unwrap();
+        ort_api_base = unsafe { onnxruntime.OrtGetApiBase() };
+    }
+    #[cfg(not(feature = "dynamic-loading"))] {
+        ort_api_base = unsafe { OrtGetApiBase() };
+    }
+
+    let g_ort = unsafe { ort_api_base.as_ref().unwrap().GetApi.unwrap()(ORT_API_VERSION) };
+
     assert_ne!(g_ort, std::ptr::null_mut());
 
     //*************************************************************************
