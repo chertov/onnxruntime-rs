@@ -32,6 +32,8 @@ const ORT_ENV_GPU: &str = "ORT_USE_CUDA";
 /// Subdirectory (of the 'target' directory) into which to extract the prebuilt library.
 const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
+const ENV_ANDROID_NDK_SYSROOT: &str = "ANDROID_NDK_SYSROOT";
+
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
     println!("Build script disabled!");
@@ -78,6 +80,27 @@ fn generate_bindings(onnxruntime_include_dir: &Path, dynamic_loading: bool) {
     let mut clang_args = vec![];
     clang_args.push(format!("-I{}", onnxruntime_include_dir.display()));
     clang_args.push(format!("-I{}/onnxruntime/core/session", onnxruntime_include_dir.display()));
+
+    match target_os.as_str() {
+        "android" => {
+            println!("cargo:rerun-if-env-changed={}", ENV_ANDROID_NDK_SYSROOT);
+            let ndk_sysroot = std::env::var(ENV_ANDROID_NDK_SYSROOT).unwrap();
+            let ndk_include = format!("{}/usr/include", ndk_sysroot);
+            let ndk_target = match target_arch.as_str() {
+                "x86" => "i686-linux-android",
+                "x86_64" => "x86_64-linux-android",
+                "arm" => "arm-linux-androideabi",
+                "aarch64" => "aarch64-linux-android",
+                target => panic!("Unknown android target '{}'", target)
+            };
+            let ndk_target_include = format!("{}/{}", ndk_include, ndk_target);
+
+            clang_args.push(format!("-I{}", ndk_include));
+            clang_args.push(format!("-I{}", ndk_target_include));
+        },
+        _ => {}
+    }
+
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
